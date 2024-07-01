@@ -1,36 +1,38 @@
-from time import sleep
 import logging
-import time
-from typing import List, Optional, Dict, Callable, Union
-import sys
 import shutil
-import numpy as np
-from flaml import tune, BlendSearch
-from flaml.tune.space import is_constant
-from flaml.automl.logger import logger_formatter
-from .openai_utils import get_key
+import sys
+import time
 from collections import defaultdict
+from time import sleep
+from typing import Callable, Dict, List, Optional, Union
+
+import numpy as np
+from flaml import BlendSearch, tune
+from flaml.automl.logger import logger_formatter
+from flaml.tune.space import is_constant
+
+from .openai_utils import get_key
 
 try:
+    import diskcache
     import openai
     from openai import (
-        RateLimitError,
-        APIError,
-        BadRequestError,
         APIConnectionError,
-        Timeout,
+        APIError,
         AuthenticationError,
+        BadRequestError,
+        RateLimitError,
+        Timeout,
     )
     from openai import Completion as openai_Completion
-    import diskcache
 
     ERROR = None
-except ImportError:
-    ERROR = ImportError(
-        "(Deprecated) The autogen.Completion class requires openai<1 and diskcache. "
-        "Please switch to autogen.OpenAIWrapper for openai>=1."
-    )
+    assert openai.__version__ < "1"
+except (AssertionError, ImportError):
     openai_Completion = object
+    # The autogen.Completion class requires openai<1
+    ERROR = AssertionError("(Deprecated) The autogen.Completion class requires openai<1 and diskcache. ")
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     # Add the console handler.
@@ -109,8 +111,8 @@ class Completion(openai_Completion):
         "prompt": "{prompt}",
     }
 
-    seed = 41
-    cache_path = f".cache/{seed}"
+    cache_seed = 41
+    cache_path = f".cache/{cache_seed}"
     # retry after this many seconds
     retry_wait_time = 10
     # fail a request after hitting RateLimitError for this many seconds
@@ -132,9 +134,9 @@ class Completion(openai_Completion):
             seed (int, Optional): The integer identifier for the pseudo seed.
                 Results corresponding to different seeds will be cached in different places.
             cache_path (str, Optional): The root path for the cache.
-                The complete cache path will be {cache_path}/{seed}.
+                The complete cache path will be {cache_path_root}/{seed}.
         """
-        cls.seed = seed
+        cls.cache_seed = seed
         cls.cache_path = f"{cache_path_root}/{seed}"
 
     @classmethod
@@ -145,7 +147,7 @@ class Completion(openai_Completion):
             seed (int, Optional): The integer identifier for the pseudo seed.
                 If omitted, all caches under cache_path_root will be cleared.
             cache_path (str, Optional): The root path for the cache.
-                The complete cache path will be {cache_path}/{seed}.
+                The complete cache path will be {cache_path_root}/{seed}.
         """
         if seed is None:
             shutil.rmtree(cache_path_root, ignore_errors=True)
@@ -229,7 +231,8 @@ class Completion(openai_Completion):
                 sleep(retry_wait_time)
             except APIError as err:
                 error_code = err and err.json_body and isinstance(err.json_body, dict) and err.json_body.get("error")
-                error_code = error_code and error_code.get("code")
+                if isinstance(error_code, dict):
+                    error_code = error_code.get("code")
                 if error_code == "content_filter":
                     raise
                 # transient error
@@ -340,7 +343,7 @@ class Completion(openai_Completion):
             config (dict): Hyperparameter setting for the openai api call.
             prune (bool, optional): Whether to enable pruning. Defaults to True.
             eval_only (bool, optional): Whether to evaluate only
-              (ignore the inference budget and do not rasie error when a request fails).
+              (ignore the inference budget and do not raise error when a request fails).
               Defaults to False.
 
         Returns:
@@ -429,7 +432,7 @@ class Completion(openai_Completion):
                     if previous_num_completions:
                         n_tokens_list[i] += n_output_tokens
                         responses_list[i].extend(responses)
-                        # Assumption 1: assuming requesting n1, n2 responses separatively then combining them
+                        # Assumption 1: assuming requesting n1, n2 responses separately then combining them
                         # is the same as requesting (n1+n2) responses together
                     else:
                         n_tokens_list.append(n_output_tokens)
@@ -738,18 +741,18 @@ class Completion(openai_Completion):
                     "api_key": os.environ.get("AZURE_OPENAI_API_KEY"),
                     "api_type": "azure",
                     "base_url": os.environ.get("AZURE_OPENAI_API_BASE"),
-                    "api_version": "2023-03-15-preview",
+                    "api_version": "2024-02-01",
                 },
                 {
                     "model": "gpt-3.5-turbo",
                     "api_key": os.environ.get("OPENAI_API_KEY"),
-                    "api_type": "open_ai",
+                    "api_type": "openai",
                     "base_url": "https://api.openai.com/v1",
                 },
                 {
                     "model": "llama-7B",
                     "base_url": "http://127.0.0.1:8080",
-                    "api_type": "open_ai",
+                    "api_type": "openai",
                 }
             ],
             prompt="Hi",
@@ -773,7 +776,7 @@ class Completion(openai_Completion):
                 Besides the parameters for the openai API call, it can also contain:
                 - `max_retry_period` (int): the total time (in seconds) allowed for retrying failed requests.
                 - `retry_wait_time` (int): the time interval to wait (in seconds) before retrying a failed request.
-                - `seed` (int) for the cache. This is useful when implementing "controlled randomness" for the completion.
+                - `cache_seed` (int) for the cache. This is useful when implementing "controlled randomness" for the completion.
 
         Returns:
             Responses from OpenAI API, with additional fields.
@@ -791,7 +794,7 @@ class Completion(openai_Completion):
             raise ERROR
 
         # Warn if a config list was provided but was empty
-        if type(config_list) is list and len(config_list) == 0:
+        if isinstance(config_list, list) and len(config_list) == 0:
             logger.warning(
                 "Completion was provided with a config_list, but the list was empty. Adopting default OpenAI behavior, which reads from the 'model' parameter instead."
             )
@@ -831,11 +834,11 @@ class Completion(openai_Completion):
             return cls._get_response(
                 params, raise_on_ratelimit_or_timeout=raise_on_ratelimit_or_timeout, use_cache=False
             )
-        seed = cls.seed
-        if "seed" in params:
-            cls.set_cache(params.pop("seed"))
+        cache_seed = cls.cache_seed
+        if "cache_seed" in params:
+            cls.set_cache(params.pop("cache_seed"))
         with diskcache.Cache(cls.cache_path) as cls._cache:
-            cls.set_cache(seed)
+            cls.set_cache(cache_seed)
             return cls._get_response(params, raise_on_ratelimit_or_timeout=raise_on_ratelimit_or_timeout)
 
     @classmethod
@@ -865,12 +868,14 @@ class Completion(openai_Completion):
         if prompt is None:
             params["messages"] = (
                 [
-                    {
-                        **m,
-                        "content": cls.instantiate(m["content"], context, allow_format_str_template),
-                    }
-                    if m.get("content")
-                    else m
+                    (
+                        {
+                            **m,
+                            "content": cls.instantiate(m["content"], context, allow_format_str_template),
+                        }
+                        if m.get("content")
+                        else m
+                    )
                     for m in messages
                 ]
                 if context
@@ -949,7 +954,7 @@ class Completion(openai_Completion):
             return_responses_and_per_instance_result (bool): Whether to also return responses
                 and per instance results in addition to the aggregated results.
             logging_level (optional): logging level. Defaults to logging.WARNING.
-            **config (dict): parametes passed to the openai api call `create()`.
+            **config (dict): parameters passed to the openai api call `create()`.
 
         Returns:
             None when no valid eval_func is provided in either test or tune;
